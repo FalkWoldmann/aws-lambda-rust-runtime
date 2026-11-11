@@ -1,10 +1,11 @@
 use crate::{custom_serde::deserialize_nullish, encodings::MillisecondTimestamp};
+use base64::Engine;
 #[cfg(feature = "builders")]
 use bon::Builder;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "catch-all-fields")]
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error, fmt};
 
 #[non_exhaustive]
 #[cfg_attr(feature = "builders", derive(Builder))]
@@ -55,6 +56,45 @@ pub struct KafkaRecord {
     pub other: serde_json::Map<String, Value>,
 }
 
+impl KafkaRecord {
+    /// Decode the base64 encoded record key.
+    ///
+    /// Returns `Ok(None)` when the record has no key.
+    pub fn decoded_key(&self) -> Result<Option<Vec<u8>>, KafkaRecordDecodeError> {
+        decode_base64(self.key.as_deref())
+    }
+
+    /// Decode the base64 encoded record value.
+    ///
+    /// Returns `Ok(None)` when the record has no value, as is the case for tombstones.
+    pub fn decoded_value(&self) -> Result<Option<Vec<u8>>, KafkaRecordDecodeError> {
+        decode_base64(self.value.as_deref())
+    }
+}
+
+fn decode_base64(encoded: Option<&str>) -> Result<Option<Vec<u8>>, KafkaRecordDecodeError> {
+    encoded
+        .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded))
+        .transpose()
+        .map_err(KafkaRecordDecodeError)
+}
+
+/// Error returned when the key or value of a [`KafkaRecord`] is not valid base64.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct KafkaRecordDecodeError(base64::DecodeError);
+
+impl fmt::Display for KafkaRecordDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid base64 in Kafka record: {}", self.0)
+    }
+}
+
+impl Error for KafkaRecordDecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -67,5 +107,39 @@ mod test {
         let output: String = serde_json::to_string(&parsed).unwrap();
         let reparsed: KafkaEvent = serde_json::from_slice(output.as_bytes()).unwrap();
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn decodes_key_and_value() {
+        let data = include_bytes!("../../fixtures/example-kafka-event.json");
+        let parsed: KafkaEvent = serde_json::from_slice(data).unwrap();
+        let record = &parsed.records["AWSKafkaTopic-0"][0];
+
+        let expected = b"8d5596b4-1813-4238-b24b-6dad8e3d1c0c".to_vec();
+        assert_eq!(record.decoded_key().unwrap(), Some(expected.clone()));
+        assert_eq!(record.decoded_value().unwrap(), Some(expected));
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn missing_key_and_value_decode_to_none() {
+        let record = KafkaRecord::default();
+
+        assert_eq!(record.decoded_key().unwrap(), None);
+        assert_eq!(record.decoded_value().unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "kafka")]
+    fn invalid_base64_is_an_error() {
+        let record = KafkaRecord {
+            key: Some("not base64!".to_string()),
+            value: Some("not base64!".to_string()),
+            ..Default::default()
+        };
+
+        assert!(record.decoded_key().is_err());
+        assert!(record.decoded_value().is_err());
     }
 }
